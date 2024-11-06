@@ -165,9 +165,9 @@ IC=${val[13]} # Constant LED current draw
 
 if [[ -z "$DIR" ]];
 then
-  DIRNAME=./$base_dir/$SERIAL/`date +"%Y%m%d%H%M"`
+  DIRNAME=./$base_dir/$SERIAL/`date +"%Y%m%d%H%M"`-max_anode
 else
-  DIRNAME=./$base_dir/$DIR/$SERIAL/`date +"%Y%m%d%H%M"`
+  DIRNAME=./$base_dir/$DIR/$SERIAL/`date +"%Y%m%d%H%M"`-max_anode
 fi
 
 for i in 12 9
