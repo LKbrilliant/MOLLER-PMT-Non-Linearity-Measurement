@@ -1,7 +1,5 @@
-# Code by:      Anuradha Gunawardhana
-# Date:         2024.04.10
-# Description:  Analysis of the multiple consecutive non-linearity runs
-
+# Code by:  Anuradha Gunawardhana
+# Date:     2024.04.10
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
@@ -30,7 +28,7 @@ selection_ratio = 60        # % portion of the data needed to be selected from a
 quartet_frequency = 960     # Chopper frequency for the quartet asymmetry analysis
 pairwise_frequency = 1920   # Chopper frequency for the pairwise asymmetry analysis
 debug = False
-# runCount = 10
+dataQualityThreshold = 3    # Maximum threshold factor of standard deviations allowed for random noise 
 
 forcePairwise=False     # force the analysis to do the pairwise analysis regardless of the chopper frequency
 forceQuartet=False
@@ -78,8 +76,44 @@ def addOrReplaceLine(data_path, lineIdentifier, value):
                     else: Exp_data.write(f'{lineIdentifier}={value}\n') # Replace the line with new data
         else: Exp_data.write(f'{lineIdentifier}={value}\n') # Add the new data line if not exist
 
-def linearFit(x,y,x_err,y_err):
+def find_anomalies(data, threshold=dataQualityThreshold):
+    return np.abs(data - np.mean(data)) > threshold * np.std(data)
 
+def dataQualityTest(data,pmt,sobelSize):
+    anomaly_threshold = 1
+    for i,y in enumerate(data):
+        # if i!=9 and i!=10: # Skip filter 10 and 11 as they are not used for the analysis but test pedestal runs
+        stat_anomalies = find_anomalies(y)
+        anSum = np.sum(stat_anomalies)
+        stat_factor = (anSum/len(stat_anomalies))*100
+        if stat_factor > anomaly_threshold: 
+            print(f'🚨 [ERROR]: {pmt} - {stat_factor:.2f}% anomalies detected in F{i+1} data')
+            return -1
+
+        # if i<9: 
+        sobel_filtered_data = abs(np.convolve(y, createSobel(sobelSize), mode="same"))*(1/sobelSize)  
+        sobel_filtered_data = sobel_filtered_data[int(sobelSize/2):-int(sobelSize/2)] # discard missing values from sides 
+        peaks, _  = find_peaks(sobel_filtered_data, distance = int(sobelSize*0.9))
+        periods = np.diff(peaks)
+        
+        sobel_anomalies = find_anomalies(periods)
+        anSum = np.sum(sobel_anomalies)
+        sobel_factor = (anSum/len(sobel_anomalies))*100
+        if sobel_factor > anomaly_threshold:
+            print(f'🚨 [ERROR]: {pmt} - {sobel_factor:.2f}% period related anomalies detected in F{i+1}')
+            return -1
+            
+    if debug: print(f"✅ [Test Passed]: Total detected data irregularities are less than {anomaly_threshold}%")
+    return 1
+
+def scale_y_err(x,y,y_err):
+    params,cov = curve_fit(linearFunc,x,y, sigma=y_err, p0=[np.mean(y), 0], absolute_sigma=True) # set initial guesses of intercept to mean of the asymmetries and 0 for slope
+    y_fit_linear = linearFunc(x,*params)
+    chisqr = np.sum(((y-y_fit_linear)/y_err)**2) # reduced chi-square
+    ndf = len(y) - 2
+    return y_err*np.sqrt(chisqr/ndf), chisqr, ndf
+
+def linearFit(x,y,x_err,y_err):
     params,cov = curve_fit(linearFunc,x,y, sigma=y_err, p0=[np.mean(y), 0], absolute_sigma=True) # set initial guesses of intercept to mean of the asymmetries and 0 for slope
     inter = params[0]
     slope = params[1]
@@ -102,20 +136,15 @@ def linearFit(x,y,x_err,y_err):
 
     return lin, lin_err, y_fit_linear, chisqr, ndf
 
-def main():
-    parser = argparse.ArgumentParser(prog='MOLLER Experiment PMT Linearity Calculation',
-                                     description='Calculate the PMT linearity for the MOLLER experiment. \nCode by: Anuradha Gunawardhana')
+def analysis(data_path,plotting=False):
     
-    parser.add_argument("-d","--dir",required=True, help="Root file directory for single run ")
-    # parser.add_argument("-r","--runs",required=True, help="Number of complete non-linearity runs")
-    args = parser.parse_args()
-    data_path = os.path.normpath(args.dir) # remove trailing slashes
     if debug: print(" ------------------------------------------------")
     if debug: print("|         Debug:Non-Linearity Analysis           |")
     if debug: print(" ------------------------------------------------")
 
     fileTestPassed = False
-    dataTestPassed = False
+    dataLengthTestPassed = False
+    dataQualityPassed = False
     #----------------------File count Test--------------------------#
     dir_files = []
     for path in os.listdir(data_path):
@@ -128,7 +157,7 @@ def main():
         if ".root" in dir:
             run = int(dir.split('-')[1])
             if run > runCount: runCount=run
-    print(f'Number of runs: {runCount}')
+    if debug: print(f'Number of runs: {runCount}')
 
     expected_file_list = []
     if debug: print(f"[Test begin]: Checking the root files - \"{data_path}\"")
@@ -137,10 +166,7 @@ def main():
             expected_file_list.append(f'Run-{u}-F{i}.root')
     # if debug: print(f"Expected files = {expected_file_list}")
     
-    
     check =  all(file in dir_files for file in expected_file_list)
-
-
 
     if check: 
         if debug: print(" ✅ [Test Passed]: All the necessary files are in order")
@@ -183,7 +209,7 @@ def main():
         logging.error(f" 🚨 [Test Failed]: Data length is less than {dataArr_limit} ms")
     else: 
         if debug: print(f" ✅ [Test Passed]: Found adequate data for the analysis")
-        dataTestPassed = True
+        dataLengthTestPassed = True
 
         TEMP_PMT = np.empty([runCount])
         TEMP_LED = np.empty([runCount])
@@ -200,7 +226,8 @@ def main():
                 value = i.split('=')[1].strip() 
                 if id == "Chopper_Frequency(Hz)" : chopper_frequency = int(value)
                 if id == "Record_Time(s)" : runTime = value
-        
+                if id == "PMT_Serial" : pmtName = value
+
         if chopper_frequency != pairwise_frequency and chopper_frequency != quartet_frequency: 
             logging.error("🚨 [Analysis Failed]:Chopper frequencies don't match")
             res=-1
@@ -248,11 +275,24 @@ def main():
         A_LED_err = np.empty([runCount, filter_count])
         I_anode = np.empty([runCount, filter_count]) #Mean voltage level
         I_anode_err = np.empty([runCount, filter_count])
+        highs_mean = np.empty([runCount,filter_count])
+        lows_mean = np.empty([runCount,filter_count])
 
-    if fileTestPassed and dataTestPassed:
+    qualityCheck = np.empty([runCount])
+    for i in range(runCount):
+        qualityCheck[i] = dataQualityTest(data[i],pmtName,sobelSize)
+
+    if not np.all(qualityCheck): 
+        logging.error(f" 🚨 [Test Failed]: Data quality check failed")
+    else: 
+        if debug: print(f" ✅ [Test Passed]: Found adequate data for the analysis")
+        dataQualityPassed = True
+
+    if fileTestPassed and dataLengthTestPassed and dataQualityPassed:
         for r in range(runCount):
-            figAsyHist, asyPlot = plt.subplots(3, 3, figsize=(13, 12),constrained_layout = True)
-            figRaw, rawPlot = plt.subplots(figsize=(10, 7), constrained_layout = True)
+            if plotting:
+                figAsyHist, asyPlot = plt.subplots(3, 3, figsize=(13, 12),constrained_layout = True)
+                figRaw, rawPlot = plt.subplots(figsize=(10, 7), constrained_layout = True)
             pt = int(dataArr_limit*0.1) # custom points
             for i,f in enumerate(data[r][0:filter_count]):
 
@@ -264,9 +304,9 @@ def main():
 
                 Asy_count = int(len(peaks)/2)-2  # -2 for skipping last two peaks
                 A_LED_temp = np.zeros(Asy_count)
-                A_LED_err_temp = np.zeros(Asy_count)
                 V_mean_temp = np.zeros(Asy_count)
-                V_mean_err_temp = np.zeros(Asy_count)
+                highs = np.zeros(Asy_count)
+                lows = np.zeros(Asy_count)
 
                 clr = ['red', 'orange'] # colors for quartet analysis separation plot
                 for u in range(Asy_count):  # Iterate over peaks and select H & L data points
@@ -286,6 +326,9 @@ def main():
                     H = max(np.mean(v1), np.mean(v2))    # Differentiate H and L using min and max
                     L = min(np.mean(v1), np.mean(v2))
 
+                    highs[u] = H
+                    lows[u] = L
+
                     V_mean_temp[u] = (H + L)/2
                     A_LED_temp[u] = (H - L)/(H + L) # calculate Asymmetry for selected pair of High and LOW
                 
@@ -294,27 +337,31 @@ def main():
                 
                 I_anode[r][i]  = (np.mean(V_mean_temp)/gain)*1000
                 I_anode_err[r][i] = ((np.std(V_mean_temp)/np.sqrt(len(V_mean_temp)))/gain)*1000 # standard error of mean
-            
-                nn, b, patches = asyPlot[int(i/3), i%3].hist(A_LED_temp, bins=100, alpha=0.6)
-                nk=np.max(nn)
-                asyPlot[int(i/3), i%3].axvline(A_LED[r][i],ls='--',color='r',label=r'Mean($\mu$)',lw=1)
-                # asyPlot[int(i/3), i%3].fill_betweenx(np.arange(0,nk), eminus, eplus, facecolor='green', alpha=0.8)
-                asyPlot[int(i/3), i%3].errorbar(A_LED[r][i], nk/10, xerr=A_LED_err[r][i],elinewidth=1, capsize=3, ecolor='k', lw=0, label=r'$\delta\mu=\pm\sigma /\sqrt{{n}}$')
-                asyPlot[int(i/3), i%3].set_title(fr"F:{filter_transmission[i]}\%, $\sigma$={np.std(A_LED_temp):.2e}, $\mu$={A_LED[0][i]:.2e}, $\sigma /                     \sqrt{{n}}$={np.std(A_LED_temp)/np.sqrt(len(A_LED_temp)):.2e}",fontsize=11)
-                asyPlot[int(i/3), i%3].set_xlabel(r"$A_{LED}$",fontsize=14)
-                asyPlot[int(i/3), i%3].set_ylabel(r"$Count$",fontsize=14)
-                asyPlot[int(i/3), i%3].margins(0)
-                asyPlot[int(i/3), i%3].legend(title=f'n={len(A_LED_temp)}')
-                asyPlot[int(i/3), i%3].xaxis.set_major_locator(AutoLocator())
-                asyPlot[int(i/3), i%3].tick_params(axis='x',rotation = 45)
 
-                rawPlot.plot(f[0:pt],alpha=0.5,label=f'F{i+1}: {filter_transmission[i]}%')
+                highs_mean[r][i] = np.mean(highs)
+                lows_mean[r][i] = np.mean(lows)
 
-            plt.suptitle(f"Asymmetry distribution [Run: {r+1:02}]", fontsize=18)
-            figAsyHist.savefig(f"{data_path}/Asymmetry_distribution_{r+1:02}.png")
-            figRaw.savefig(f"{data_path}/Raw_data_{r+1:02}.png")
-            plt.close(figAsyHist) # Close the figure to save memory
-            plt.close(figRaw)
+                if plotting:
+                    nn, b, patches = asyPlot[int(i/3), i%3].hist(A_LED_temp, bins=100, alpha=0.6)
+                    nk=np.max(nn)
+                    asyPlot[int(i/3), i%3].axvline(A_LED[r][i],ls='--',color='r',label=r'Mean($\mu$)',lw=1)
+                    # asyPlot[int(i/3), i%3].fill_betweenx(np.arange(0,nk), eminus, eplus, facecolor='green', alpha=0.8)
+                    asyPlot[int(i/3), i%3].errorbar(A_LED[r][i], nk/10, xerr=A_LED_err[r][i],elinewidth=1, capsize=3, ecolor='k', lw=0, label=r'$\delta\mu=\pm\sigma /\sqrt{{n}}$')
+                    asyPlot[int(i/3), i%3].set_title(fr"F:{filter_transmission[i]}\%, $\sigma$={np.std(A_LED_temp):.2e}, $\mu$={A_LED[0][i]:.2e}, $\sigma /                     \sqrt{{n}}$={np.std(A_LED_temp)/np.sqrt(len(A_LED_temp)):.2e}",fontsize=11)
+                    asyPlot[int(i/3), i%3].set_xlabel(r"$A_{LED}$",fontsize=14)
+                    asyPlot[int(i/3), i%3].set_ylabel(r"$Count$",fontsize=14)
+                    asyPlot[int(i/3), i%3].margins(0)
+                    asyPlot[int(i/3), i%3].legend(title=f'n={len(A_LED_temp)}')
+                    asyPlot[int(i/3), i%3].xaxis.set_major_locator(AutoLocator())
+                    asyPlot[int(i/3), i%3].tick_params(axis='x',rotation = 45)
+
+                    rawPlot.plot(f[0:pt],alpha=0.5,label=f'F{i+1}: {filter_transmission[i]}%')
+            if plotting:
+                plt.suptitle(f"Asymmetry distribution [Run: {r+1:02}]", fontsize=18)
+                figAsyHist.savefig(f"{data_path}/Asymmetry_distribution_{r+1:02}.png")
+                figRaw.savefig(f"{data_path}/Raw_data_{r+1:02}.png")
+                plt.close(figAsyHist) # Close the figure to save memory
+                plt.close(figRaw)
             
 
         if debug: print(" ✅ [Complete]: LED Asymmetries, Means and errors are calculated")
@@ -324,18 +371,19 @@ def main():
         addOrReplaceLine(data_path, 'Pedestal_Means[pre,post](V)', f'[{pedestal_mean[0]},{pedestal_mean[1]}]')
         addOrReplaceLine(data_path, 'Pedestal_STD[pre,post](V)', f'[{pedestal_sigma[0]},{pedestal_sigma[1]}]')
 
-        figAsyScatter, asyScatterPlot = plt.subplots(figsize=(6,4))
-        for i in range(runCount):
-            asyScatterPlot.errorbar(I_anode[i],A_LED[i], yerr=A_LED_err[i],fmt='.',ms=3, color='#e81d1d',
-                   ecolor='black',elinewidth=0.5,capsize=3,capthick=0.5)
-        asyScatterPlot.set_xlabel(r'Anode Current ($\mu$A)', fontsize=12)
-        asyScatterPlot.set_ylabel('LED Asymmetry',fontsize=12)
-        asyScatterPlot.set_title(f'Run Count = {runCount}',fontsize=12)
-        figAsyScatter.savefig(f'{data_path}/all-{runCount}-runs.png',
-                transparent=False,
-                dpi=500,
-                format='png',
-                bbox_inches='tight')
+        if plotting:
+            figAsyScatter, asyScatterPlot = plt.subplots(figsize=(6,4))
+            for i in range(runCount):
+                asyScatterPlot.errorbar(I_anode[i],A_LED[i], yerr=A_LED_err[i],fmt='.',ms=3, color='#e81d1d',
+                    ecolor='black',elinewidth=0.5,capsize=3,capthick=0.5)
+            asyScatterPlot.set_xlabel(r'Anode Current ($\mu$A)', fontsize=12)
+            asyScatterPlot.set_ylabel('LED Asymmetry',fontsize=12)
+            asyScatterPlot.set_title(f'Run Count = {runCount}',fontsize=12)
+            figAsyScatter.savefig(f'{data_path}/all-{runCount}-runs.png',
+                    transparent=False,
+                    dpi=500,
+                    format='png',
+                    bbox_inches='tight')
 
         A_LED_mean = np.empty(filter_count)
         A_LED_mean_err = np.empty(filter_count)
@@ -359,122 +407,135 @@ def main():
 
         # lin1, lin_err1, Asy_fit1, chi1, ndf1 = linearFit(I_anode_mean,A_LED_mean,I_anode_mean_err,A_LED_mean_err)
         # lin2, lin_err2, Asy_fit2, chi2, ndf2 = linearFit(I_anode[0],A_LED[0],I_anode_err[0],A_LED_err[0])
+        if plotting:
+            figMeanSingle, meanSinglePlot = plt.subplots(figsize=(6,4))
+            meanSinglePlot.errorbar(I_anode_mean,A_LED_mean, yerr=A_LED_mean_err,fmt='.',ms=3, alpha=0.7, lw=0, color='r',
+                    ecolor='r',elinewidth=0.5,capsize=3,capthick=0.5, label=f'Mean of {runCount} runs')
+            
+            # meanSinglePlot.plot(I_anode_mean,Asy_fit1,label='Linear fit:mean',c='tab:blue')
 
-        figMeanSingle, meanSinglePlot = plt.subplots(figsize=(6,4))
-        meanSinglePlot.errorbar(I_anode_mean,A_LED_mean, yerr=A_LED_mean_err,fmt='.',ms=3, alpha=0.7, lw=0, color='r',
-                ecolor='r',elinewidth=0.5,capsize=3,capthick=0.5, label=f'Mean of {runCount} runs')
-        
-        # meanSinglePlot.plot(I_anode_mean,Asy_fit1,label='Linear fit:mean',c='tab:blue')
+            meanSinglePlot.errorbar(I_anode[0],A_LED[0], yerr=A_LED_err[0],fmt='.',ms=3, alpha=0.7, lw=0, color='g',
+                ecolor='g',elinewidth=0.5,capsize=3,capthick=0.5, label='Single run')
+            
+            # meanSinglePlot.plot(I_anode[0],Asy_fit2,label='Linear fit:single',c='tab:purple')
 
-        meanSinglePlot.errorbar(I_anode[0],A_LED[0], yerr=A_LED_err[0],fmt='.',ms=3, alpha=0.7, lw=0, color='g',
-            ecolor='g',elinewidth=0.5,capsize=3,capthick=0.5, label='Single run')
-        
-        # meanSinglePlot.plot(I_anode[0],Asy_fit2,label='Linear fit:single',c='tab:purple')
-
-        meanSinglePlot.set_xlabel(r'Anode Current ($\mu$A)', fontsize=12)
-        meanSinglePlot.set_ylabel('LED Asymmetry',fontsize=12)
-        # ax3.set_title(f'Mean of {runCount}-runs')
-        legend = meanSinglePlot.legend(fancybox=False, edgecolor="black")
-        legend.get_frame().set_linewidth(0.5)
-        figMeanSingle.savefig(f'{data_path}/single-with-{runCount}-runs.png',
-                transparent=False,
-                dpi=500, 
-                format='png',
-                bbox_inches='tight')
-        
-        # fig4, ax4 = plt.subplots(figsize=(6,4))
-        # clr=np.linspace(0,255,runCount)
-        # for i in range(9):
-        #     # ax4.errorbar(I_anode[i],A_LED[i], yerr=A_LED_err[i],fmt='.',ms=3, color='#e81d1d',
-        #     #             ecolor='black',elinewidth=0.5,capsize=3,capthick=0.5)
-        #     ax4.scatter(I_anode[:,i],A_LED[:,i], s=3, c=clr, cmap='rainbow', alpha=0.8)
-        #     # ax4.plot(I_anode[:,i],A_LED[:,i],lw=0.5)
-        # ax4.set_xlabel(r'Anode Current ($\mu$A)', fontsize=12)
-        # ax4.set_ylabel('LED Asymmetry',fontsize=12)
-        # ax4.set_title(f'Run Count = {runCount}',fontsize=12)
-        # fig4.savefig(f'{data_path}/{runCount}-runs-connected.png',
-        #         transparent=False,
-        #         dpi=500,
-        #         format='png',
-        #         bbox_inches='tight')
-
-        figOverTime, overtimePlot = plt.subplots(10,1, figsize=(12,12),sharex=True)
-        for i in range(10):
-            if i<9:
-                overtimePlot[i].plot(np.arange(1,runCount+1),A_LED[:,i])
-                overtimePlot[i].set_ylabel(r'$A_{LED}$',fontsize=12)
-            else:
-                overtimePlot[i].errorbar(np.arange(1,runCount+1),linearity, yerr=linearity_err, elinewidth=1, capsize=3, ecolor='k', lw=0.5, ls='--')
-                overtimePlot[i].set_ylabel(r'$Lin(\%)$',fontsize=12)
-
-        overtimePlot[9].set_xlabel(r'Run number', fontsize=12)
-        overtimePlot[0].set_title(f'Asymmetry variations',fontsize=12)
-        plt.xticks(range(1,runCount+1))
-        plt.hspace=0
-        figOverTime.savefig(f'{data_path}/{runCount}-asy-lin-overtime.png',
-                transparent=False,
-                dpi=500, 
-                format='png',
-                bbox_inches='tight')
-
-        figAsyMultiHist, asyMultiPlot = plt.subplots(3, 3, figsize=(11, 9),constrained_layout = True)
-        for i in range(filter_count):
-            nn, b, patches = asyMultiPlot[int(i/3), i%3].hist(A_LED[:,i], bins=20, alpha=0.6)
-            nk=np.max(nn)
-            asyMultiPlot[int(i/3), i%3].axvline(A_LED_mean[i],ls='--',color='r',label=r'Mean($\mu$)',lw=1)
-            asyMultiPlot[int(i/3), i%3].errorbar(A_LED_mean[i], nk/10, xerr=A_LED_mean_err[i],elinewidth=1, capsize=3, ecolor='k', lw=0, label=r'$\delta=\pm\sigma$')
-            asyMultiPlot[int(i/3), i%3].set_title(fr"F:{filter_transmission[i]}\%, $\mu$={A_LED_mean[i]:.2e}, $\sigma$={A_LED_mean_err[i]:.2e}",fontsize=11)
-            asyMultiPlot[int(i/3), i%3].set_xlabel(r"$A_{LED}$",fontsize=14)
-            asyMultiPlot[int(i/3), i%3].set_ylabel(r"$Count$",fontsize=14)
-            legend = asyMultiPlot[int(i/3), i%3].legend(fancybox=False, edgecolor="black")
+            meanSinglePlot.set_xlabel(r'Anode Current ($\mu$A)', fontsize=12)
+            meanSinglePlot.set_ylabel('LED Asymmetry',fontsize=12)
+            # ax3.set_title(f'Mean of {runCount}-runs')
+            legend = meanSinglePlot.legend(fancybox=False, edgecolor="black")
             legend.get_frame().set_linewidth(0.5)
-            asyMultiPlot[int(i/3), i%3].xaxis.set_major_locator(AutoLocator())
-            asyMultiPlot[int(i/3), i%3].tick_params(axis='x',rotation = 45)
-        plt.suptitle(f"Consecutive {runCount} runs", fontsize=18)
-        figAsyMultiHist.savefig(f"{data_path}/Multiple-Asymmetry_distribution.png")
+            figMeanSingle.savefig(f'{data_path}/single-with-{runCount}-runs.png',
+                    transparent=False,
+                    dpi=500, 
+                    format='png',
+                    bbox_inches='tight')
+        
+            # fig4, ax4 = plt.subplots(figsize=(6,4))
+            # clr=np.linspace(0,255,runCount)
+            # for i in range(9):
+            #     # ax4.errorbar(I_anode[i],A_LED[i], yerr=A_LED_err[i],fmt='.',ms=3, color='#e81d1d',
+            #     #             ecolor='black',elinewidth=0.5,capsize=3,capthick=0.5)
+            #     ax4.scatter(I_anode[:,i],A_LED[:,i], s=3, c=clr, cmap='rainbow', alpha=0.8)
+            #     # ax4.plot(I_anode[:,i],A_LED[:,i],lw=0.5)
+            # ax4.set_xlabel(r'Anode Current ($\mu$A)', fontsize=12)
+            # ax4.set_ylabel('LED Asymmetry',fontsize=12)
+            # ax4.set_title(f'Run Count = {runCount}',fontsize=12)
+            # fig4.savefig(f'{data_path}/{runCount}-runs-connected.png',
+            #         transparent=False,
+            #         dpi=500,
+            #         format='png',
+            #         bbox_inches='tight')
 
-        figTemp, tempPlot = plt.subplots(3, 3, figsize=(11, 9),constrained_layout = True)
-        clr=np.linspace(0,255,runCount)
-        for i in range(filter_count):
-            tempPlot[int(i/3), i%3].scatter(TEMP_LED, A_LED[:,i],s=10,c=clr, cmap='viridis', alpha=0.8)
-            tempPlot[int(i/3), i%3].set_title(fr"F:{filter_transmission[i]}\%",fontsize=11)
-            tempPlot[int(i/3), i%3].set_xlabel(r"$LED Temp. (^oC)$",fontsize=13)
-            tempPlot[int(i/3), i%3].set_ylabel(r"$A_{LED}$",fontsize=13)
-            # tempPlot[int(i/3), i%3].legend()
-            tempPlot[int(i/3), i%3].xaxis.set_major_locator(AutoLocator())
-            tempPlot[int(i/3), i%3].tick_params(axis='x',rotation = 45)
-        plt.suptitle(f"Consecutive {runCount} runs", fontsize=18)
-        # plt.colorbar(orientation="horizontal").set_label(label='new label',size=15,weight='bold')
-        figTemp.colorbar(tempPlot[0, 0].scatter(TEMP_LED, A_LED[:,0], c=clr, s=0), 
-                         ticks=np.linspace(0,255,10),
-                         format=mticker.FixedFormatter(np.linspace(1,runCount,10, dtype=int)),
-                         ax=tempPlot, 
-                         location='right',
-                         aspect=60,
-                         pad=0.02,
-                         label="Run Number")
-        figTemp.savefig(f"{data_path}/Asy-Temp.png")
+            figOverTime, overtimePlot = plt.subplots(10,1, figsize=(12,12),sharex=True)
+            for i in range(10):
+                if i<9:
+                    overtimePlot[i].plot(np.arange(1,runCount+1),A_LED[:,i])
+                    overtimePlot[i].set_ylabel(r'$A_{LED}$',fontsize=12)
+                else:
+                    overtimePlot[i].errorbar(np.arange(1,runCount+1),linearity, yerr=linearity_err, elinewidth=1, capsize=3, ecolor='k', lw=0.5, ls='--')
+                    overtimePlot[i].set_ylabel(r'$Lin(\%)$',fontsize=12)
 
-        figAllTemps, allTempPlot = plt.subplots(figsize=(6,3))
-        allTempPlot.plot(np.arange(1,runCount+1),TEMP_PMT, label='PMT')
-        allTempPlot.plot(np.arange(1,runCount+1),TEMP_LED, label='LED')
-        allTempPlot.set_xticks(range(1,runCount+1))
-        allTempPlot.set_ylabel(r"$Temp. (^oC)$",fontsize=12)
-        allTempPlot.set_xlabel("Run Number",fontsize=12)
-        allTempPlot.set_title(f'Run Count = {runCount}',fontsize=14)
-        legend = allTempPlot.legend(fancybox=False, edgecolor="black")
-        legend.get_frame().set_linewidth(0.5)
-        figAllTemps.savefig(f"{data_path}/AllTemps.png")
+            overtimePlot[9].set_xlabel(r'Run number', fontsize=12)
+            overtimePlot[0].set_title(f'Asymmetry variations',fontsize=12)
+            plt.xticks(range(1,runCount+1))
+            plt.hspace=0
+            figOverTime.savefig(f'{data_path}/{runCount}-asy-lin-overtime.png',
+                    transparent=False,
+                    dpi=500, 
+                    format='png',
+                    bbox_inches='tight')
 
-        figLinTemp, linTempPlot = plt.subplots(figsize=(10,6))
-        linTempPlot.scatter(TEMP_LED, linearity)
-        linTempPlot.set_xlabel(r"$LED Temp. (^oC)$",fontsize=12)
-        linTempPlot.set_ylabel("Non-Linearity(\%)",fontsize=12)
-        linTempPlot.set_title('Non-linearity vs. LED Temp.',fontsize=14)
-        figLinTemp.savefig(f"{data_path}/lin-temp.png")
+            figAsyMultiHist, asyMultiPlot = plt.subplots(3, 3, figsize=(11, 9),constrained_layout = True)
+            for i in range(filter_count):
+                nn, b, patches = asyMultiPlot[int(i/3), i%3].hist(A_LED[:,i], bins=20, alpha=0.6)
+                nk=np.max(nn)
+                asyMultiPlot[int(i/3), i%3].axvline(A_LED_mean[i],ls='--',color='r',label=r'Mean($\mu$)',lw=1)
+                asyMultiPlot[int(i/3), i%3].errorbar(A_LED_mean[i], nk/10, xerr=A_LED_mean_err[i],elinewidth=1, capsize=3, ecolor='k', lw=0, label=r'$\delta=\pm\sigma$')
+                asyMultiPlot[int(i/3), i%3].set_title(fr"F:{filter_transmission[i]}\%, $\mu$={A_LED_mean[i]:.2e}, $\sigma$={A_LED_mean_err[i]:.2e}",fontsize=11)
+                asyMultiPlot[int(i/3), i%3].set_xlabel(r"$A_{LED}$",fontsize=14)
+                asyMultiPlot[int(i/3), i%3].set_ylabel(r"$Count$",fontsize=14)
+                legend = asyMultiPlot[int(i/3), i%3].legend(fancybox=False, edgecolor="black")
+                legend.get_frame().set_linewidth(0.5)
+                asyMultiPlot[int(i/3), i%3].xaxis.set_major_locator(AutoLocator())
+                asyMultiPlot[int(i/3), i%3].tick_params(axis='x',rotation = 45)
+            plt.suptitle(f"Consecutive {runCount} runs", fontsize=18)
+            figAsyMultiHist.savefig(f"{data_path}/Multiple-Asymmetry_distribution.png")
+
+            figTemp, tempPlot = plt.subplots(3, 3, figsize=(11, 9),constrained_layout = True)
+            clr=np.linspace(0,255,runCount)
+            for i in range(filter_count):
+                tempPlot[int(i/3), i%3].scatter(TEMP_LED, A_LED[:,i],s=10,c=clr, cmap='viridis', alpha=0.8)
+                tempPlot[int(i/3), i%3].set_title(fr"F:{filter_transmission[i]}\%",fontsize=11)
+                tempPlot[int(i/3), i%3].set_xlabel(r"$LED Temp. (^oC)$",fontsize=13)
+                tempPlot[int(i/3), i%3].set_ylabel(r"$A_{LED}$",fontsize=13)
+                # tempPlot[int(i/3), i%3].legend()
+                tempPlot[int(i/3), i%3].xaxis.set_major_locator(AutoLocator())
+                tempPlot[int(i/3), i%3].tick_params(axis='x',rotation = 45)
+            plt.suptitle(f"Consecutive {runCount} runs", fontsize=18)
+            # plt.colorbar(orientation="horizontal").set_label(label='new label',size=15,weight='bold')
+            figTemp.colorbar(tempPlot[0, 0].scatter(TEMP_LED, A_LED[:,0], c=clr, s=0), 
+                            ticks=np.linspace(0,255,10),
+                            format=mticker.FixedFormatter(np.linspace(1,runCount,10, dtype=int)),
+                            ax=tempPlot, 
+                            location='right',
+                            aspect=60,
+                            pad=0.02,
+                            label="Run Number")
+            figTemp.savefig(f"{data_path}/Asy-Temp.png")
+
+            figAllTemps, allTempPlot = plt.subplots(figsize=(6,3))
+            allTempPlot.plot(np.arange(1,runCount+1),TEMP_PMT, label='PMT')
+            allTempPlot.plot(np.arange(1,runCount+1),TEMP_LED, label='LED')
+            allTempPlot.set_xticks(range(1,runCount+1))
+            allTempPlot.set_ylabel(r"$Temp. (^oC)$",fontsize=12)
+            allTempPlot.set_xlabel("Run Number",fontsize=12)
+            allTempPlot.set_title(f'Run Count = {runCount}',fontsize=14)
+            legend = allTempPlot.legend(fancybox=False, edgecolor="black")
+            legend.get_frame().set_linewidth(0.5)
+            figAllTemps.savefig(f"{data_path}/AllTemps.png")
+
+            figLinTemp, linTempPlot = plt.subplots(figsize=(10,6))
+            linTempPlot.scatter(TEMP_LED, linearity)
+            linTempPlot.set_xlabel(r"$LED Temp. (^oC)$",fontsize=12)
+            linTempPlot.set_ylabel("Non-Linearity(\%)",fontsize=12)
+            linTempPlot.set_title('Non-linearity vs. LED Temp.',fontsize=14)
+            figLinTemp.savefig(f"{data_path}/lin-temp.png")
+    
+        return I_anode, A_LED, I_anode_err, A_LED_err, highs_mean, lows_mean
 
     else: 
         logging.error(" 🚨 [Analysis Failed]: One or more tests failed")
+        print("[Errors detedted]:",data_path)
+
+def main():
+    parser = argparse.ArgumentParser(prog='MOLLER Experiment PMT Linearity Calculation',
+                                     description='Calculate the PMT linearity for the MOLLER experiment. \nCode by: Anuradha Gunawardhana')
     
+    parser.add_argument("-d","--dir",required=True, help="Root file directory for single run ")
+    # parser.add_argument("-r","--runs",required=True, help="Number of complete non-linearity runs")
+    args = parser.parse_args()
+    data_path = os.path.normpath(args.dir) # remove trailing slashes
+    analysis(data_path,plotting=True)
+
 if __name__ == "__main__":
     main()
